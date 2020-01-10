@@ -42,8 +42,6 @@ COLOR_WARNING_WINDOWS = 14
 
 def main():
 
-    proprietary_codecs = False
-
     nw_version = get_latest_stable_nwjs()
     host_platform = get_host_platform()
     target_arch = get_host_architecture()
@@ -72,23 +70,21 @@ def main():
 
         if target_arch == 'ia32':
             target_cpu = 'x86'
+        
 
-        proprietary_codecs = args.proprietary_codecs
-        if proprietary_codecs and platform.system() == 'Windows' and not 'CYGWIN_NT' in platform.system():
-            print_warning('Script needs to be executed under CygWin to build FFmpeg \nwith proprietary codecs on Windows environments, \nread https://github.com/iteufel/nwjs-ffmpeg-prebuilt/blob/master/guides/build_windows.md\nExiting...')
-            sys.exit(1)
+        print_info('Building ffmpeg for {0} on {1} for {2}'.format(nw_version, host_platform, target_cpu))
 
-        print_info('Building ffmpeg for {0} on {1} for {2}, proprietary_codecs = {3}'.format(nw_version, host_platform, target_cpu, proprietary_codecs))
+        isVersion = bool(re.match(r"\d+\.\d+\.\d+", nw_version))
 
         create_directory(PATH_BUILD)
 
         clean_output_directory()
 
-        setup_chromium_depot_tools(nw_version)
+        setup_chromium_depot_tools(nw_version, isVersion)
 
-        clone_chromium_source_code(nw_version)
+        clone_chromium_source_code(nw_version, isVersion)
 
-        reset_chromium_src_to_nw_version(nw_version)
+        reset_chromium_src_to_nw_version(nw_version, isVersion)
 
         generate_build_and_deps_files()
 
@@ -96,11 +92,11 @@ def main():
 
         gclient_sync()
 
-        check_build_with_proprietary_codecs(proprietary_codecs, host_platform, target_arch)
+        patch_linux_sanitizer_ia32(target_cpu)
 
         build(target_cpu)
 
-        zip_release_output_library(nw_version, platform_release_name, target_arch, proprietary_codecs, get_out_library_path(host_platform), PATH_RELEASES)
+        zip_release_output_library(nw_version, platform_release_name, target_arch, get_out_library_path(host_platform), PATH_RELEASES)
 
         print_ok('DONE!!')
 
@@ -111,17 +107,28 @@ def main():
         sys.exit(1)
 
 
+def patch_linux_sanitizer_ia32(target_cpu):
+    host_platform = get_host_platform()
+    if host_platform == 'linux':
+        oldpath = os.getcwd()
+        os.chdir(PATH_THIRD_PARTY_FFMPEG)
+        os.system('git reset --hard')
+        if target_cpu == 'x86':
+            shutil.copy(os.path.join(PATH_BASE, 'patch', host_platform, 'sanitizer_ia32.patch'), os.getcwd())
+            os.system('git apply --ignore-space-change --ignore-whitespace sanitizer_ia32.patch')
+        os.chdir(oldpath)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='ffmpeg builder script.')
     parser.add_argument('-c', '--clean', help='Clean the workspace, removes downloaded source code', required=False, action='store_true')
-    parser.add_argument('-nw', '--nw_version', help='Build ffmpeg for the specified Nw.js version', required=False)
+    parser.add_argument('-nw', '--nw_version', help='Build ffmpeg for the specified Nw.js version or Branche', required=False)
     parser.add_argument('-ta', '--target_arch', help='Target architecture, ia32, x64', required=False)
-    parser.add_argument('-pc', '--proprietary_codecs', help='Build ffmpeg with proprietary codecs', required=False, action='store_true')
     return parser.parse_args()
 
 
-def grep_dep(reg, repo, dir, deps_str):
-    pat = re.compile(reg)
+def grep_dep(reg, repo, dir, deps_str, opts):
+    pat = re.compile(reg, opts)
     found = re.search(pat, deps_str)
     if found is None:
         return None
@@ -205,7 +212,7 @@ def clean_output_directory():
     shutil.rmtree(PATH_OUT, ignore_errors=True)
 
 
-def setup_chromium_depot_tools(nw_version):
+def setup_chromium_depot_tools(nw_version, isVersion = True):
     os.chdir(PATH_BUILD)
     if not os.path.isdir(os.path.join(PATH_DEPOT_TOOLS, '.git')):
         print_info('Cloning Chromium depot tools in {0}...'.format(os.getcwd()))
@@ -217,54 +224,111 @@ def setup_chromium_depot_tools(nw_version):
     os.environ["PATH"] += os.pathsep + PATH_DEPOT_TOOLS
     if platform.system() == 'Windows' or 'CYGWIN_NT' in platform.system():
         os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = '0'
+        os.environ["GYP_MSVS_VERSION"] = '2017'
 
     print_info('Creating .gclient file...')
-    subprocess.check_call('gclient config --unmanaged --name=src https://github.com/nwjs/chromium.src.git@tags/nw-v{0}'.format(nw_version), shell=True)
+    if(isVersion):
+      subprocess.check_call('gclient config --unmanaged --name=src https://github.com/nwjs/chromium.src.git@tags/nw-v{0}'.format(nw_version), shell=True)
+    else:
+      subprocess.check_call('gclient config --unmanaged --name=src https://github.com/nwjs/chromium.src.git@tree/{0}'.format(nw_version), shell=True)
 
 
-def clone_chromium_source_code(nw_version):
+def clone_chromium_source_code(nw_version, isVersion = True):
     os.chdir(PATH_BUILD)
     print_info('Cloning Chromium source code for nw-{0} in {1}'.format(nw_version, os.getcwd()))
-    os.system('git clone --depth=1 -b nw-v{0} --single-branch {1} src'.format(
-        nw_version, 'https://github.com/nwjs/chromium.src.git'))
+    if isVersion:
+      os.system('git clone --depth=1 -b nw-v{0} --single-branch {1} src'.format(nw_version, 'https://github.com/nwjs/chromium.src.git'))
+    else:
+      os.system('git clone --depth=1 -b {0} --single-branch {1} src'.format(nw_version, 'https://github.com/nwjs/chromium.src.git'))
 
 
-def reset_chromium_src_to_nw_version(nw_version):
+def reset_chromium_src_to_nw_version(nw_version, isVersion = True):
     os.chdir(PATH_SRC)
-    print_info('Hard source code reset to nw {0} specified version'.format(nw_version))
-    os.system('git reset --hard tags/nw-v{0}'.format(nw_version))
+    if isVersion:
+      print_info('Hard source code reset to nw {0} specified version'.format(nw_version))
+      os.system('git reset --hard tags/nw-v{0}'.format(nw_version))
+    else:
+      os.system('git reset --hard')
 
 
 def get_min_deps(deps_str):
     # deps
     deps_list = {
-        'buildtools': {
-            'reg': ur'buildtools\.git@(.+)\'',
-            'repo': '/chromium/buildtools.git',
-            'path': 'src/buildtools'
-        },
       'gyp': {
-          'reg': ur'gyp\.git@(.+)\'',
+          'reg': ur"gyp.git.+@'.+'(.+)'",
           'repo': '/external/gyp.git',
-          'path': 'src/tools/gyp'
+          'path': 'src/tools/gyp',
+          'opts': re.IGNORECASE
       },
       'patched-yasm': {
-          'reg': ur'patched-yasm\.git@(.+)\'',
+          'reg': ur"patched-yasm.git.+@'.+'(.+)'",
           'repo': '/chromium/deps/yasm/patched-yasm.git',
-          'path': 'src/third_party/yasm/source/patched-yasm'
+          'path': 'src/third_party/yasm/source/patched-yasm',
+          'opts': re.IGNORECASE
       },
       'ffmpeg': {
-          'reg': ur'ffmpeg\.git@(.+)\'',
+          'reg': ur"ffmpeg.git.+@'.+'(.+)'",
           'repo': '/chromium/third_party/ffmpeg',
-          'path': 'src/third_party/ffmpeg'
+          'path': 'src/third_party/ffmpeg',
+          'opts': re.IGNORECASE
       },
+      'angle': {
+          'reg': ur"angle_revision':\s*'(.+)'",
+          'repo': '/angle/angle.git',
+          'path': 'src/third_party/angle',
+          'opts': re.IGNORECASE
+      },
+      'android_tools': {
+          'reg': ur"android_tools.git'.*'(.+)'",
+          'repo': '/android_tools.git',
+          'path': 'src/third_party/android_tools',
+          'opts': re.IGNORECASE
+      },
+      'nasm': {
+          'reg': ur"nasm.git'.*?'(.{40})'",
+          'repo': '/chromium/deps/nasm.git',
+          'path': 'src/third_party/nasm',
+          'opts':  re.MULTILINE | re.IGNORECASE | re.DOTALL
+      },
+      'xz': {
+          'reg': ur"xz.git.+@'.+'(.+)'",
+          'repo': '/chromium/deps/xz.git',
+          'path': 'src/chrome/installer/mac/third_party/xz/xz',
+          'opts': re.IGNORECASE
+      },
+      'libcxx': {
+          'reg': ur"libcxx_revision.*\"(.+)\"",
+          'repo': '/chromium/llvm-project/libcxx.git',
+          'path': 'src/buildtools/third_party/libc++/trunk',
+          'opts': re.IGNORECASE
+      },
+      'libcxxabi': {
+          'reg': ur"libcxxabi_revision.*\"(.+)\"",
+          'repo': '/chromium/llvm-project/libcxxabi.git',
+          'path': 'src/buildtools/third_party/libc++abi/trunk',
+          'opts': re.IGNORECASE
+      }
     }
     min_deps_list = []
     for k, v in deps_list.items():
-        dep = grep_dep(v['reg'], v['repo'], v['path'], deps_str)
+        dep = grep_dep(v['reg'], v['repo'], v['path'], deps_str, v['opts'])
         if dep is None:
             raise Exception("`%s` is not found in DEPS" % k)
         min_deps_list.append(dep)
+
+    # Not nice but fix for mac
+    min_deps_list.append('''
+      'src/tools/clang/dsymutil': {
+        'packages': [
+          {
+            'package': 'chromium/llvm-build-tools/dsymutil',
+            'version': 'kykIT8m8YzNqqLP2xFGBTuo0ZtU9lom3BwiStWleyWkC',
+          }
+        ],
+        'condition': 'checkout_mac',
+        'dep_type': 'cipd',
+      },
+    ''')
 
     return textwrap.dedent('''
     deps = {
@@ -273,15 +337,11 @@ def get_min_deps(deps_str):
     ''') % "\n".join(min_deps_list)
 
 
-def get_min_vars():
+def get_min_vars(deps_str):
     # vars
-    # copied from DEPS
-    return textwrap.dedent('''
-    vars = {
-      'chromium_git':
-        'https://chromium.googlesource.com',
-    }
-    ''')
+    regex = r"(.+?)deps\s+="
+    matches = re.search(regex, deps_str, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+    return textwrap.dedent(matches.group(1))
 
 
 def get_min_hooks():
@@ -293,28 +353,45 @@ def get_min_hooks():
         'action': [
           'python',
           'src/build/linux/sysroot_scripts/install-sysroot.py',
-          '--running-as-hook'
+          '--arch=x86'
         ],
         'pattern':
           '.',
         'name':
-          'sysroot'
+          'sysroot_x86',
+        'condition':
+          'checkout_linux and (checkout_x86 or checkout_x64)'
       },
       {
         'action': [
           'python',
-          'src/build/mac_toolchain.py'
+          'src/build/linux/sysroot_scripts/install-sysroot.py',
+          '--arch=x64'
         ],
         'pattern':
           '.',
         'name':
-          'mac_toolchain'
+          'sysroot_x64',
+        'condition':
+          'checkout_linux and checkout_x64'
+      },
+      {
+          'name': 'mac_toolchain',
+          'pattern': '.',
+          'condition': 'checkout_ios or checkout_mac',
+          'action': ['python', 'src/build/mac_toolchain.py'],
+      },
+      {
+        # Update the Windows toolchain if necessary.  Must run before 'clang' below.
+        'name': 'win_toolchain',
+        'pattern': '.',
+        'condition': 'checkout_win',
+        'action': ['python', 'src/build/vs_toolchain.py', 'update', '--force'],
       },
       {
         'action': [
           'python',
-          'src/tools/clang/scripts/update.py',
-          '--if-needed'
+          'src/tools/clang/scripts/update.py'
         ],
         'pattern':
           '.',
@@ -323,9 +400,17 @@ def get_min_hooks():
       },
       {
         'action': [
+          'python',
+          'src/chrome/android/profiles/update_afdo_profile.py'
+        ],
+        'pattern': '.',
+        'condition': 'checkout_android or checkout_linux',
+        'name': 'Fetch Android AFDO profile'
+      },
+      {
+        'action': [
           'download_from_google_storage',
           '--no_resume',
-          '--platform=win32',
           '--no_auth',
           '--bucket',
           'chromium-gn',
@@ -335,13 +420,14 @@ def get_min_hooks():
         'pattern':
           '.',
         'name':
-          'gn_win'
+          'gn_win',
+        'condition':
+          'host_os == "win"'
       },
       {
         'action': [
           'download_from_google_storage',
           '--no_resume',
-          '--platform=darwin',
           '--no_auth',
           '--bucket',
           'chromium-gn',
@@ -351,13 +437,14 @@ def get_min_hooks():
         'pattern':
           '.',
         'name':
-          'gn_mac'
+          'gn_mac',
+        'condition':
+          'host_os == "mac"'
       },
       {
         'action': [
           'download_from_google_storage',
           '--no_resume',
-          '--platform=linux*',
           '--no_auth',
           '--bucket',
           'chromium-gn',
@@ -367,7 +454,56 @@ def get_min_hooks():
         'pattern':
           '.',
         'name':
-          'gn_linux64'
+          'gn_linux64',
+        'condition':
+          'host_os == "linux"'
+      },
+      {
+        'name': 'clang_format_mac',
+        'pattern': '.',
+        'condition': 'host_os == "mac"',
+        'action': [ 'python',
+                    'src/third_party/depot_tools/download_from_google_storage.py',
+                    '--no_resume',
+                    '--no_auth',
+                    '--bucket', 'chromium-clang-format',
+                    '-s', 'src/buildtools/mac/clang-format.sha1',
+        ],
+      },
+        # Pull rc binaries using checked-in hashes.
+      {
+        'name': 'rc_win',
+        'pattern': '.',
+        'condition': 'checkout_win and host_os == "win"',
+        'action': [ 'python',
+                'src/third_party/depot_tools/download_from_google_storage.py',
+                '--no_resume',
+                '--no_auth',
+                '--bucket', 'chromium-browser-clang/rc',
+                '-s', 'src/build/toolchain/win/rc/win/rc.exe.sha1',
+        ],
+      },
+      {
+        'name': 'rc_mac',
+        'pattern': '.',
+        'condition': 'checkout_win and host_os == "mac"',
+        'action': [ 'python',
+                    'src/third_party/depot_tools/download_from_google_storage.py',
+                    '--no_resume',
+                    '--no_auth',
+                    '--bucket', 'chromium-browser-clang/rc',
+                    '-s', 'src/build/toolchain/win/rc/mac/rc.sha1',
+        ],
+      },
+      {
+        'name': 'lastchange',
+        'pattern': '.',
+        'action': ['python', 'src/build/util/lastchange.py', '-o', 'src/build/util/LASTCHANGE'],
+      },
+      {
+        'name': 'gpu_lists_version',
+        'pattern': '.',
+        'action': ['python', 'src/build/util/lastchange.py', '-m', 'GPU_LISTS_VERSION', '--revision-id-only', '--header', 'src/gpu/config/gpu_lists_version.h'],
       },
     ]
     recursedeps = [
@@ -420,7 +556,7 @@ def generate_build_and_deps_files():
     print_info('Backing up and overwriting DEPS...')
     shutil.move('DEPS', 'DEPS.bak')
     with open('DEPS', 'w') as f:
-        f.write("%s\n%s\n%s" % (get_min_vars(), get_min_deps(deps_str), get_min_hooks()))
+        f.write("%s\n%s\n%s" % (get_min_vars(deps_str), get_min_deps(deps_str), get_min_hooks()))
 
     print_info('Backing up and overwriting BUILD.gn...')
     shutil.move('BUILD.gn', 'BUILD.gn.bak')
@@ -437,81 +573,11 @@ def generate_build_and_deps_files():
         f.write(BUILD_gn)
 
 
-def cygwin_linking_setup():
-    if 'CYGWIN_NT' in platform.system():
-        if os.path.isfile('/usr/bin/link.exe'):
-            print_info('Overriding CygWin linker with MSVC linker...')
-            shutil.move('/usr/bin/link.exe', '/usr/bin/link.exe.1')
-
-        if not os.path.isfile('/usr/local/bin/cygwin-wrapper'):
-            print_info('Copying Cygwin wrapper...')
-            shutil.copy(os.getcwd() + '/chromium/scripts/cygwin-wrapper', '/usr/local/bin/cygwin-wrapper')
-
-
-def check_build_with_proprietary_codecs(proprietary_codecs, host_platform, target_arch):
-
-    # going to ffmpeg folder
-    os.chdir(PATH_THIRD_PARTY_FFMPEG)
-
-    if proprietary_codecs:
-        print_info('Building ffmpeg with proprietary codecs...')
-        if not os.path.isfile('build_ffmpeg_proprietary_codecs.patch'):
-            print_info('Applying codecs patch with ac3 for {0}...'.format(host_platform))
-            # os.path.join
-            shutil.copy(os.path.join(PATH_BASE, 'patch', host_platform, 'build_ffmpeg_proprietary_codecs.patch'), os.getcwd())
-            # apply codecs patch
-            os.system('git apply --ignore-space-change --ignore-whitespace build_ffmpeg_proprietary_codecs.patch')
-
-        cygwin_linking_setup()
-
-        print_info('Starting build...')
-
-        # build ffmpeg
-        subprocess.check_call('./chromium/scripts/build_ffmpeg.py {0} {1}'.format(host_platform, target_arch), shell=True)
-        # copy the new generated ffmpeg config
-        print_info('Copying new ffmpeg configuration...')
-        subprocess.call('./chromium/scripts/copy_config.sh', shell=True)
-        print_info('Creating a GYP include file for building FFmpeg from source...')
-        # generate the ffmpeg configuration
-        subprocess.check_call('./chromium/scripts/generate_gn.py', shell=True)
-
-        if 'CYGWIN_NT' in platform.system():
-            print_info('Applying fix for error LNK2001: unresolved external symbol _ff_w64_guid_data')
-            fix_external_symbol_ff_w64_guid_data()
-    else:
-        if os.path.isfile('build_ffmpeg_proprietary_codecs.patch'):
-            print_info('Restoring ffmpeg configuration to defaults...')
-            os.system('git clean -df')
-            os.system('git checkout -- .')
-
-
-def replace_in_file(file_name, search_string, replace_string):
-    filedata = None
-    with open(file_name, 'r') as file :
-      filedata = file.read()
-
-    filedata = filedata.replace(search_string, replace_string)
-
-    with open(file_name, 'w') as file :
-      file.write(filedata)
-
-
-def fix_external_symbol_ff_w64_guid_data():
-    # https://bugs.chromium.org/p/chromium/issues/detail?id=264459
-    shutil.copyfile('ffmpeg_generated.gni', 'ffmpeg_generated.gni.bak')
-    replace = '''"libavformat/vorbiscomment.c",
-    "libavformat/w64.c",'''
-    replace_in_file('ffmpeg_generated.gni', '"libavformat/vorbiscomment.c",', replace)
-
-
-def zip_release_output_library(nw_version, platform_release_name, target_arch, proprietary_codecs, out_library_path, output_release_path):
+def zip_release_output_library(nw_version, platform_release_name, target_arch, out_library_path, output_release_path):
     create_directory(output_release_path)
     print_info('Creating release zip...')
-    pc = ''
-    if proprietary_codecs:
-        pc = '-custom'
     if os.path.isfile(out_library_path):
-        with zipfile.ZipFile(os.path.join(output_release_path, '{0}-{1}-{2}{3}.zip'.format(nw_version, platform_release_name, target_arch, pc)), 'w', zipfile.ZIP_DEFLATED) as release_zip:
+        with zipfile.ZipFile(os.path.join(output_release_path, '{0}-{1}-{2}{3}.zip'.format(nw_version, platform_release_name, target_arch, '')), 'w', zipfile.ZIP_DEFLATED) as release_zip:
             release_zip.write(out_library_path, os.path.basename(out_library_path))
             release_zip.close()
     else:
